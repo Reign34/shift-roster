@@ -98,15 +98,62 @@ with a hole in the night shift.
 ### Verified, not assumed
 
 The generator reports its own fairness numbers, which is exactly the kind of
-thing that can be wrong and look right. I checked the four hard rules by
-querying the database directly after a run, rather than trusting the output:
+thing that can be wrong and look right. The four hard rules are covered by the
+test suite below, and were also checked by querying the database directly
+after a real run.
 
+## Tests
+
+```bash
+cd server
+npm test
 ```
-PASS  nobody works a day they blocked
-PASS  nobody has two shifts in a day
-PASS  day off after every night shift
-PASS  every shift fully staffed
-```
+
+47 tests using Node's built-in test runner, so there's no test framework to
+install. Three files:
+
+| File | Covers |
+|---|---|
+| `generator.test.js` | the four hard rules, fairness spread, coverage, edge cases |
+| `auth.test.js` | hashing, salting, token signing and forgery |
+| `api.test.js` | registration, login, roles, schedules, availability |
+
+The API tests run the real Express app on a throwaway port against a
+temporary database, so they exercise the actual routes rather than mocks.
+
+### The tests were wrong before they were right
+
+A passing test proves nothing on its own. To check these actually catch
+anything, I broke the code on purpose, one rule at a time, and confirmed the
+suite went red each time.
+
+The first attempt was a failure, and a useful one. I deleted the
+"day off after a night shift" rule from the generator entirely — **and all
+14 tests still passed.**
+
+The reason: that test ran against the full roster of 33 staff covering 7 per
+shift. There is so much slack there that nobody is ever *needed* the day after
+a night, so the rule never actually gets exercised. The test was watching a
+situation that could not go wrong.
+
+The fix was to make the scenario tight enough that the constraint binds: 7
+people covering 2 per shift, where the generator has no choice but to consider
+someone who worked last night. With the rule deleted that produces 5
+violations; with it in place, none.
+
+Five mutations in total, all caught after that fix:
+
+| Rule removed | Tests that went red |
+|---|---|
+| day off after nights | 1 |
+| unavailable days | 2 |
+| one shift per day | 1 |
+| self-promotion guard on register | 4 |
+| `requireManager` role check | 2 |
+
+The lesson worth keeping: when a test passes, ask whether it *could* have
+failed. A test that watches a situation that can't go wrong is just a slower
+way of writing nothing.
 
 ## Notes
 
