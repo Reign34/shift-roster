@@ -13,6 +13,24 @@ export const db = new DatabaseSync(DB_PATH);
 // Off by default in SQLite, which silently allows orphaned rows
 db.exec('PRAGMA foreign_keys = ON');
 
+// Wraps a function so every statement inside it either all happens or none
+// of it does. Needed wherever a half-finished write would leave bad data:
+// a schedule with only some of its shifts, or a swap that closed the request
+// without actually moving the shift.
+export function transaction(fn) {
+  return (...args) => {
+    db.exec('BEGIN');
+    try {
+      const result = fn(...args);
+      db.exec('COMMIT');
+      return result;
+    } catch (err) {
+      db.exec('ROLLBACK');
+      throw err;
+    }
+  };
+}
+
 export function migrate() {
   db.exec(`
     CREATE TABLE IF NOT EXISTS users (

@@ -1,51 +1,60 @@
 # Shift Roster
 
-Scheduling tool for a 24/7 operation. Managers build a rota across three daily
-shifts, staff mark when they can't work, and the roster can be generated
-automatically so the load stays even.
+Scheduling tool for an operation that runs 24/7. Managers build a rota across
+three daily shifts, staff mark the days they can't work, and the roster can be
+generated automatically so the load stays even.
 
-I started this because building duty rosters by hand is miserable. The same
-four problems come up every time: keeping it fair, working around who's
-unavailable, redoing everything when one person swaps out, and rebuilding the
-whole thing from scratch each week.
+I built this because making duty rosters by hand is miserable, and the same
+four problems come up every time:
 
-**Work in progress.** Phase 1 (the API and authentication) is done.
+| The problem | What the app does |
+|---|---|
+| Keeping it fair | Generator balances total shifts and nights separately |
+| Availability clashes | Staff mark their own days; the generator treats those as hard rules |
+| Last-minute swaps | Staff offer a shift, someone else takes it, coverage is preserved |
+| Rebuilding every week | Create a schedule from dates and generate; nothing is retyped |
 
-## Status
+## Features
 
-- [x] **Phase 1** — API, database schema, register/login, role-based access
-- [ ] **Phase 2** — React frontend, staff management
-- [ ] **Phase 3** — Build a schedule, assign people, mark availability
-- [ ] **Phase 4** — Generate a roster automatically, balanced for fairness
-- [ ] **Phase 5** — Swap requests
-- [ ] **Phase 6** — Deploy
+**Managers** create schedules, generate rosters, override assignments by hand,
+publish, and manage the team.
+
+**Staff** see their own shifts, mark availability as unavailable or preferred,
+offer shifts for swap and pick up other people's.
 
 ## Stack
 
 Node and Express for the API, SQLite through Node's built-in `node:sqlite`,
-and React with Vite for the frontend. Authentication is written by hand with
-`scrypt` and JSON Web Tokens rather than an auth service, because the point
-was to understand what those services are doing.
+React with Vite and React Router on the frontend. Authentication is written by
+hand with `scrypt` and JSON Web Tokens rather than an auth service, because the
+point was to understand what those services do.
 
-SQLite keeps setup to nothing: no database to install, no connection string.
-All the SQL lives in `server/src/db.js`, so moving to Postgres later is a
-contained job rather than a rewrite.
+SQLite means no database to install. All the SQL is in `server/src/db.js`, so
+moving to Postgres later is a contained job rather than a rewrite.
 
 ## Running it
+
+Two terminals.
 
 ```bash
 cd server
 npm install
 cp .env.example .env     # then put a real secret in it
-npm run seed             # creates a manager and 33 staff
+npm run seed             # a manager and 33 staff
 npm run dev
 ```
 
-The seed prints the login. Every seeded account uses the same demo password.
+```bash
+cd client
+npm install
+npm run dev
+```
+
+The seed prints the login. Every seeded account shares the same demo password.
 
 ## The shift model
 
-A 24/7 operation needs the full day covered, so there are three shifts:
+Three shifts cover the full day:
 
 | Shift | Hours |
 |---|---|
@@ -53,59 +62,128 @@ A 24/7 operation needs the full day covered, so there are three shifts:
 | Afternoon | 14:00 – 22:00 |
 | Night | 22:00 – 06:00 |
 
-That's 21 shifts a week. At 7 people per shift it needs 147 person-shifts,
-and 33 staff working 5 days each gives 165. Tight but workable, which is
-what makes the fairness part in Phase 4 actually interesting: there isn't much
-slack, so a naive assignment leaves someone doing three nights in a row.
+21 shifts a week. At 7 people each that needs 147 person-shifts; 33 staff
+working at most 5 days each gives 165. The margin is thin, which is what makes
+the generator worth having: a naive assignment leaves someone on three nights
+in a row while someone else does two shifts all week.
+
+## How the generator works
+
+Hard rules, which are never broken:
+
+- not on a day they marked unavailable
+- never two shifts in one day
+- a day off after a night shift
+- at most 5 shifts in the period
+
+Soft rules, which decide between everyone still eligible. Each is a number
+added to a score, and the lowest score wins:
+
+```js
+let score = person.total * 100;                 // fewest shifts goes first
+if (isNight) score += person.nights * 60;       // spread the nights too
+if (workedYesterday) score += person.streak * 15;
+if (preferredThisDay) score -= 40;
+score += Math.random() * 10;                    // break ties differently each run
+```
+
+Shifts are filled in date order, because "did they work yesterday" is only
+knowable once yesterday is done. It's greedy rather than a proper constraint
+solver, so it isn't guaranteed optimal, but it runs instantly and on the test
+data it fills all 147 slots with everyone on 4–5 shifts and 1–2 nights.
+
+When it can't fill something it says so rather than quietly producing a roster
+with a hole in the night shift.
+
+### Verified, not assumed
+
+The generator reports its own fairness numbers, which is exactly the kind of
+thing that can be wrong and look right. I checked the four hard rules by
+querying the database directly after a run, rather than trusting the output:
+
+```
+PASS  nobody works a day they blocked
+PASS  nobody has two shifts in a day
+PASS  day off after every night shift
+PASS  every shift fully staffed
+```
 
 ## Notes
 
 ### Passwords
 
-Stored as a `scrypt` hash with a random per-user salt, never as text. The salt
-means two people who pick the same password still get different hashes, so
-cracking one doesn't crack the other.
+`scrypt` with a random per-user salt, never stored as text. The salt means two
+people who pick the same password still get different hashes.
 
-Comparison uses `timingSafeEqual` rather than `===`. A normal string compare
-returns as soon as it finds a difference, so the time it takes leaks how much
-of the hash you guessed correctly.
+Comparison uses `timingSafeEqual`, not `===`. A normal string compare returns
+as soon as it finds a difference, so how long it takes leaks how much of the
+hash you guessed right.
 
 ### Logging in with an email that doesn't exist
 
-The obvious version returns early when no user is found. That's measurably
-faster than a real login, so someone can time the responses and work out which
-emails are registered. Instead it hashes against a dummy value and returns the
-identical message either way.
+The obvious version returns early when there's no user. That's measurably
+faster than a real login, so someone can time responses and work out which
+emails are registered. This one hashes against a dummy value and returns the
+same message either way.
 
 ### What's inside a JWT
 
-Not encryption. The payload is base64 and anyone holding the token can read it:
+Not encryption. The payload is base64 and anyone with the token can read it:
 
 ```json
 { "sub": 1, "role": "manager", "name": "Rota Manager", "iat": ..., "exp": ... }
 ```
 
-What they can't do is change it, because the signature wouldn't match without
-the server's secret. So a token can carry who you are, but never anything
+They can't change it, because the signature wouldn't match without the
+server's secret. So a token can say who you are but must never carry anything
 private.
 
 ### The token says who, the database says what
 
-`requireAuth` reads the user row on every request rather than trusting the
-role in the token. Tokens last a week, so a role change or a deleted account
-would otherwise take up to seven days to take effect.
+`requireAuth` reads the user row on every request instead of trusting the role
+inside the token. Tokens last a week, so otherwise a demotion wouldn't take
+effect for seven days.
 
 ### 401 vs 403
 
-401 means "I don't know who you are", 403 means "I know, and the answer is no".
-Mixing them up makes the frontend impossible to write, because it can't tell
-when to redirect to the login page.
+401 means "I don't know who you are", 403 means "I know, and no". Mixing them
+up makes the frontend impossible to write, because it can't tell when to send
+someone to the login page.
 
 ### Self-promotion
 
-`POST /api/auth/register` accepts a `role` field and deliberately ignores it.
-The first account created becomes the manager so there's a way to bootstrap;
-everyone after is staff until an existing manager promotes them.
+`POST /api/auth/register` accepts a `role` and deliberately ignores it. The
+first account created becomes the manager so there's a way to bootstrap;
+everyone after is staff until a manager promotes them.
+
+### node:sqlite is not better-sqlite3
+
+I wrote `db.transaction(...)` out of habit. That's a better-sqlite3 API and
+`node:sqlite` doesn't have it, so every write that needed a transaction
+returned a 500. There's a small `transaction()` helper in `db.js` now that
+wraps BEGIN / COMMIT / ROLLBACK.
+
+Transactions matter in two places here: creating a schedule writes 21 shift
+rows and a schedule that got half of them would be worse than none, and
+accepting a swap has to move the shift *and* close the request or neither.
+
+### A bug worth keeping
+
+Accepting a swap returned a 500. A shift holds several people, so the roster
+had put both the person offering and the person accepting on the same shift,
+and reassigning produced a duplicate the UNIQUE constraint rejected. My clash
+check only looked for conflicts on *other* shifts that day.
+
+The database caught it, which is the point of having the constraint, but a
+constraint violation reaching the user as "something went wrong" is a bug in
+its own right. Now it's a 409 saying "you are already on that shift".
+
+### The third auth state
+
+`AuthContext` tracks `checking`, `signed-in` and `signed-out`, not just a
+boolean. On a refresh there's a token in localStorage but no user yet, and
+without the third state the app flashes the login screen before deciding you
+were signed in after all.
 
 ## API
 
@@ -115,21 +193,40 @@ everyone after is staff until an existing manager promotes them.
 | POST | `/api/auth/login` | anyone |
 | GET | `/api/auth/me` | signed in |
 | GET | `/api/staff` | signed in |
-| POST | `/api/staff` | manager |
-| DELETE | `/api/staff/:id` | manager |
+| POST / DELETE | `/api/staff`, `/api/staff/:id` | manager |
+| GET | `/api/schedules`, `/api/schedules/:id` | signed in |
+| POST | `/api/schedules` | manager |
+| POST | `/api/schedules/:id/generate` | manager |
+| POST | `/api/schedules/:id/publish` | manager |
+| POST | `/api/schedules/shifts/:id/assign` | manager |
+| DELETE | `/api/schedules/assignments/:id` | manager |
+| GET / PUT / DELETE | `/api/availability` | own, managers can read any |
+| GET | `/api/swaps`, `/api/swaps/my-shifts` | signed in |
+| POST | `/api/swaps`, `/api/swaps/:id/accept\|decline\|cancel` | signed in |
 
 ## Layout
 
 ```
-server/
-├── src/
-│   ├── index.js          express app and error handling
-│   ├── db.js             connection, schema, all the SQL
-│   ├── auth.js           hashing and tokens
-│   ├── middleware.js     requireAuth, requireManager
-│   ├── seed.js           demo data
-│   └── routes/
-│       ├── auth.js
-│       └── staff.js
-└── .env.example
+server/src/
+├── index.js          express app and error handling
+├── db.js             connection, schema, transaction helper
+├── auth.js           hashing and tokens
+├── middleware.js     requireAuth, requireManager
+├── generator.js      the fairness algorithm
+├── seed.js
+└── routes/           auth, staff, schedules, availability, swaps
+
+client/src/
+├── App.jsx           routing and the protected shell
+├── AuthContext.jsx   who is signed in
+├── api.js            one place that talks to the server
+└── pages/            Login, Schedules, ScheduleDetail, MyShifts,
+                      Availability, Staff
 ```
+
+## Still to do
+
+- Deploy it (move to Postgres at the same time)
+- Recurring schedule templates
+- Email or push when a swap is offered
+- Per-person shift preferences (someone who *wants* nights)

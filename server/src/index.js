@@ -4,6 +4,9 @@ import cors from 'cors';
 import { migrate } from './db.js';
 import { authRoutes } from './routes/auth.js';
 import { staffRoutes } from './routes/staff.js';
+import { scheduleRoutes } from './routes/schedules.js';
+import { availabilityRoutes } from './routes/availability.js';
+import { swapRoutes } from './routes/swaps.js';
 
 migrate();
 
@@ -18,6 +21,9 @@ app.get('/api/health', (req, res) => {
 
 app.use('/api/auth', authRoutes);
 app.use('/api/staff', staffRoutes);
+app.use('/api/schedules', scheduleRoutes);
+app.use('/api/availability', availabilityRoutes);
+app.use('/api/swaps', swapRoutes);
 
 app.use((req, res) => {
   res.status(404).json({ error: 'No such endpoint' });
