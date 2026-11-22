@@ -1,22 +1,34 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { generateRoster } from '../src/generator.js';
+import { generateRoster } from '../src/generator.ts';
+import type { Shift, ShiftName, StaffMember, GeneratorResult } from '../src/types.ts';
 
 // The generator is a pure function: shifts and people in, assignments out,
 // no database. That makes it the easiest thing in the project to test
 // properly and the most important, because a scheduling bug is invisible
 // until someone turns up for a shift that isn't theirs.
 
-const SHIFT_NAMES = ['Morning', 'Afternoon', 'Night'];
+const SHIFT_NAMES: ShiftName[] = ['Morning', 'Afternoon', 'Night'];
 
-function addDays(iso, n) {
+function addDays(iso: string, n: number): string {
   const d = new Date(iso + 'T00:00:00Z');
   d.setUTCDate(d.getUTCDate() + n);
   return d.toISOString().slice(0, 10);
 }
 
-function buildShifts({ start = '2026-01-05', days = 7, requiredStaff = 7 } = {}) {
-  const shifts = [];
+type Options = {
+  start?: string;
+  days?: number;
+  requiredStaff?: number;
+  staffCount?: number;
+  shifts?: Shift[];
+  staff?: StaffMember[];
+  unavailable?: Set<string>;
+  preferred?: Set<string>;
+};
+
+function buildShifts({ start = '2026-01-05', days = 7, requiredStaff = 7 }: Options = {}): Shift[] {
+  const shifts: Shift[] = [];
   let id = 1;
   for (let d = 0; d < days; d++) {
     const date = addDays(start, d);
@@ -27,37 +39,42 @@ function buildShifts({ start = '2026-01-05', days = 7, requiredStaff = 7 } = {})
   return shifts;
 }
 
-function buildStaff(count = 33) {
+function buildStaff(count = 33): StaffMember[] {
   return Array.from({ length: count }, (_, i) => ({ id: i + 1, name: `Person ${i + 1}` }));
 }
 
-function run(options = {}) {
-  const shifts = options.shifts || buildShifts(options);
-  const staff = options.staff || buildStaff(options.staffCount);
+type RunResult = GeneratorResult & { shifts: Shift[]; staff: StaffMember[] };
+
+function run(options: Options = {}): RunResult {
+  const shifts = options.shifts ?? buildShifts(options);
+  const staff = options.staff ?? buildStaff(options.staffCount);
   const result = generateRoster({
     shifts,
     staff,
-    unavailable: options.unavailable || new Set(),
-    preferred: options.preferred || new Set()
+    unavailable: options.unavailable ?? new Set<string>(),
+    preferred: options.preferred ?? new Set<string>()
   });
   return { shifts, staff, ...result };
 }
 
 // Turns the flat assignment list into something the assertions can ask
 // questions of: what is each person working, and on which dates.
-function byPerson({ assignments, shifts }) {
+function byPerson({ assignments, shifts }: RunResult): Map<number, Shift[]> {
   const shiftById = new Map(shifts.map((s) => [s.id, s]));
-  const map = new Map();
+  const map = new Map<number, Shift[]>();
   for (const a of assignments) {
-    if (!map.has(a.user_id)) map.set(a.user_id, []);
-    map.get(a.user_id).push(shiftById.get(a.shift_id));
+    const shift = shiftById.get(a.shift_id);
+    if (!shift) continue;
+    const list = map.get(a.user_id) ?? [];
+    list.push(shift);
+    map.set(a.user_id, list);
   }
   return map;
 }
 
 describe('hard rules', () => {
   test('nobody is assigned on a day they marked unavailable', () => {
-    const unavailable = new Set();
+    const unavailable = new Set<string>();
     for (const date of ['2026-01-06', '2026-01-07', '2026-01-08']) {
       for (const id of [1, 2, 3, 4, 5]) unavailable.add(`${id}|${date}`);
     }
@@ -66,6 +83,7 @@ describe('hard rules', () => {
 
     for (const a of result.assignments) {
       const shift = result.shifts.find((s) => s.id === a.shift_id);
+      assert.ok(shift);
       assert.ok(
         !unavailable.has(`${a.user_id}|${shift.date}`),
         `person ${a.user_id} was assigned on ${shift.date} despite being unavailable`
@@ -78,10 +96,7 @@ describe('hard rules', () => {
 
     for (const [userId, shifts] of byPerson(result)) {
       const dates = shifts.map((s) => s.date);
-      assert.equal(
-        new Set(dates).size, dates.length,
-        `person ${userId} has two shifts on one day`
-      );
+      assert.equal(new Set(dates).size, dates.length, `person ${userId} has two shifts on one day`);
     }
   });
 
@@ -131,9 +146,7 @@ describe('fairness', () => {
   });
 
   test('a preferred day makes a person more likely to be picked for it', () => {
-    // One person prefers every day; over a full week they should come out
-    // at or above the average rather than being passed over.
-    const preferred = new Set();
+    const preferred = new Set<string>();
     for (let d = 0; d < 7; d++) preferred.add(`1|${addDays('2026-01-05', d)}`);
 
     const result = run({ preferred });
@@ -152,7 +165,6 @@ describe('coverage', () => {
   });
 
   test('shortfalls are reported rather than silently left empty', () => {
-    // Six people cannot cover 21 shifts of 7
     const result = run({ staffCount: 6 });
 
     assert.ok(result.gaps.length > 0, 'expected gaps to be reported');
@@ -166,9 +178,9 @@ describe('coverage', () => {
   test('never assigns more people than a shift asked for', () => {
     const result = run({ requiredStaff: 3 });
 
-    const perShift = new Map();
+    const perShift = new Map<number, number>();
     for (const a of result.assignments) {
-      perShift.set(a.shift_id, (perShift.get(a.shift_id) || 0) + 1);
+      perShift.set(a.shift_id, (perShift.get(a.shift_id) ?? 0) + 1);
     }
     for (const [shiftId, count] of perShift) {
       assert.ok(count <= 3, `shift ${shiftId} has ${count} people, limit was 3`);
@@ -184,8 +196,19 @@ describe('edge cases', () => {
     assert.equal(result.gaps.length, 21);
   });
 
+  test('an empty roster reports a spread of zero, not Infinity', () => {
+    // Math.min() of an empty array is Infinity, which would have leaked
+    // into the API response as `minShifts: null` once serialised.
+    const { fairness } = run({ staff: [] });
+
+    assert.equal(fairness.spread.minShifts, 0);
+    assert.equal(fairness.spread.maxShifts, 0);
+    assert.equal(fairness.spread.minNights, 0);
+    assert.equal(fairness.spread.maxNights, 0);
+  });
+
   test('everyone unavailable every day leaves the roster empty, not broken', () => {
-    const unavailable = new Set();
+    const unavailable = new Set<string>();
     for (let id = 1; id <= 33; id++) {
       for (let d = 0; d < 7; d++) unavailable.add(`${id}|${addDays('2026-01-05', d)}`);
     }

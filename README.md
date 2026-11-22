@@ -24,8 +24,8 @@ offer shifts for swap and pick up other people's.
 
 ## Stack
 
-Node and Express for the API, SQLite through Node's built-in `node:sqlite`,
-React with Vite and React Router on the frontend. Authentication is written by
+TypeScript on Node with Express for the API, SQLite through Node's built-in
+`node:sqlite`, React with Vite and React Router on the frontend. Authentication is written by
 hand with `scrypt` and JSON Web Tokens rather than an auth service, because the
 point was to understand what those services do.
 
@@ -41,7 +41,9 @@ cd server
 npm install
 cp .env.example .env     # then put a real secret in it
 npm run seed             # a manager and 33 staff
-npm run dev
+npm run dev              # runs the .ts files directly, no build step
+npm run typecheck        # tsc --noEmit
+npm test
 ```
 
 ```bash
@@ -155,6 +157,70 @@ The lesson worth keeping: when a test passes, ask whether it *could* have
 failed. A test that watches a situation that can't go wrong is just a slower
 way of writing nothing.
 
+## TypeScript
+
+The server is TypeScript with **no build step**. Node 24 runs `.ts` files
+directly by stripping the type annotations out, so `node src/index.ts` just
+works and there is no `dist/` folder to keep in sync.
+
+The catch, and it is an important one: **stripping is not checking.** Node
+removes the types without looking at them, so this runs perfectly happily:
+
+```ts
+const n: number = "this is a string";   // node runs it, prints the string
+```
+
+Type checking is therefore a separate command, `npm run typecheck`, which runs
+`tsc --noEmit`. Same compiler everyone else uses, just never asked to produce
+output.
+
+One quirk of running `.ts` natively: imports need the real extension,
+`./db.ts`, not the `./db.js` that TypeScript projects usually write. That is
+what `allowImportingTsExtensions` in the tsconfig is for.
+
+### What the types actually caught
+
+Converting was not just annotating what was already there. Turning `strict` on
+surfaced four genuine problems:
+
+**`req.params.id` can be undefined.** With `noUncheckedIndexedAccess`, reading
+a route parameter gives `string | undefined`, and four places were passing
+that straight into SQL. They are now `Number(req.params.id)`.
+
+**`Math.min()` of an empty array is `Infinity`.** With no staff at all, the
+fairness summary reported `minShifts: Infinity`, which becomes `null` once it
+goes through `JSON.stringify` and out to the client. The existing test only
+checked that no assignments were produced, so it never noticed. There is a
+test for it now.
+
+**`jwt.verify` returns `string | JwtPayload`**, because a token can legally
+carry a bare string. Ours never does, but the compiler was right to make that
+explicit rather than let it be assumed.
+
+**The exact bug from before.** Writing `db.transaction(...)` out of habit, the
+mistake that cost a debugging session when it showed up as a 500:
+
+```
+Property 'transaction' does not exist on type 'DatabaseSync'.
+Did you mean 'isTransaction'?
+```
+
+Caught in the editor, before the file was even saved.
+
+The honest limit, though: types catch *shape* mistakes. The swap bug further
+down this page — forgetting that two people on the same shift could both end
+up assigned to it — had perfectly correct types the entire time. Both ids were
+numbers. The code was still wrong. That is what the tests are for.
+
+A small example of what the types buy, from `types.ts`:
+
+```ts
+export type ShiftName = 'Morning' | 'Afternoon' | 'Night';
+```
+
+With that, `shift.shift_name === 'Nigth'` stops compiling instead of quietly
+never matching anything.
+
 ## Notes
 
 ### Passwords
@@ -255,12 +321,14 @@ were signed in after all.
 
 ```
 server/src/
-├── index.js          express app and error handling
-├── db.js             connection, schema, transaction helper
-├── auth.js           hashing and tokens
-├── middleware.js     requireAuth, requireManager
-├── generator.js      the fairness algorithm
-├── seed.js
+├── index.ts          starts the server
+├── app.ts            express app and error handling
+├── db.ts             connection, schema, transaction helper
+├── types.ts          the shapes everything else shares
+├── auth.ts           hashing and tokens
+├── middleware.ts     requireAuth, requireManager
+├── generator.ts      the fairness algorithm
+├── seed.ts
 └── routes/           auth, staff, schedules, availability, swaps
 
 client/src/

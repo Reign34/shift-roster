@@ -9,18 +9,20 @@ process.env.DB_PATH = TEST_DB;
 process.env.JWT_SECRET = 'test-secret-not-the-real-one';
 process.env.NODE_ENV = 'test';
 
-const { createApp } = await import('../src/app.js');
-const { db } = await import('../src/db.js');
+const { createApp } = await import('../src/app.ts');
+const { db } = await import('../src/db.ts');
 
-let server;
-let base;
+let server: import('node:http').Server;
+let base: string;
 
 before(async () => {
   // Port 0 means "any free port", so tests never collide with a dev server
   const app = createApp();
   server = app.listen(0);
   await new Promise((resolve) => server.once('listening', resolve));
-  base = `http://localhost:${server.address().port}/api`;
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('no port');
+  base = `http://localhost:${address.port}/api`;
 });
 
 after(async () => {
@@ -29,7 +31,17 @@ after(async () => {
   await rm(TEST_DB, { force: true });
 });
 
-async function call(path, { method = 'GET', body, token } = {}) {
+type CallOptions = { method?: string; body?: unknown; token?: string };
+
+// Responses are typed loosely on purpose. These tests are checking status
+// codes and a handful of fields, and mirroring every server type here would
+// mean the tests pass just because both sides share a wrong assumption.
+type JsonBody = Record<string, any>;
+
+async function call(
+  path: string,
+  { method = 'GET', body, token }: CallOptions = {}
+): Promise<{ status: number; body: JsonBody }> {
   const response = await fetch(base + path, {
     method,
     headers: {
@@ -38,7 +50,8 @@ async function call(path, { method = 'GET', body, token } = {}) {
     },
     body: body ? JSON.stringify(body) : undefined
   });
-  return { status: response.status, body: await response.json().catch(() => null) };
+  const parsed = await response.json().catch(() => ({}));
+  return { status: response.status, body: (parsed ?? {}) as JsonBody };
 }
 
 describe('registration', () => {
@@ -127,8 +140,8 @@ describe('login', () => {
 });
 
 describe('protected routes', () => {
-  let managerToken;
-  let staffToken;
+  let managerToken: string;
+  let staffToken: string;
 
   before(async () => {
     managerToken = (await call('/auth/login', {
@@ -182,8 +195,8 @@ describe('protected routes', () => {
 });
 
 describe('schedules', () => {
-  let managerToken;
-  let staffToken;
+  let managerToken: string;
+  let staffToken: string;
 
   before(async () => {
     managerToken = (await call('/auth/login', {
@@ -247,7 +260,7 @@ describe('schedules', () => {
 });
 
 describe('availability', () => {
-  let staffToken;
+  let staffToken: string;
 
   before(async () => {
     staffToken = (await call('/auth/login', {
@@ -264,7 +277,7 @@ describe('availability', () => {
     });
 
     const res = await call('/availability', { token: staffToken });
-    const forThatDay = res.body.entries.filter((e) => e.date === '2026-03-03');
+    const forThatDay = res.body.entries.filter((e: { date: string }) => e.date === '2026-03-03');
 
     assert.equal(forThatDay.length, 1);
     assert.equal(forThatDay[0].status, 'preferred');

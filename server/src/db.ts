@@ -17,8 +17,13 @@ db.exec('PRAGMA foreign_keys = ON');
 // of it does. Needed wherever a half-finished write would leave bad data:
 // a schedule with only some of its shifts, or a swap that closed the request
 // without actually moving the shift.
-export function transaction(fn) {
-  return (...args) => {
+//
+// The generics keep the wrapped function's own arguments and return type,
+// so calling it still type-checks exactly as the original did.
+export function transaction<Args extends unknown[], Result>(
+  fn: (...args: Args) => Result
+): (...args: Args) => Result {
+  return (...args: Args): Result => {
     db.exec('BEGIN');
     try {
       const result = fn(...args);
@@ -31,7 +36,18 @@ export function transaction(fn) {
   };
 }
 
-export function migrate() {
+// node:sqlite returns rows as null-prototype objects typed loosely, so each
+// query site says what it expects. This helper keeps that to one cast rather
+// than scattering `as` through the route files.
+export function queryOne<T>(sql: string, ...params: unknown[]): T | undefined {
+  return db.prepare(sql).get(...(params as never[])) as T | undefined;
+}
+
+export function queryAll<T>(sql: string, ...params: unknown[]): T[] {
+  return db.prepare(sql).all(...(params as never[])) as T[];
+}
+
+export function migrate(): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS users (
       id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -88,13 +104,13 @@ export function migrate() {
     );
 
     CREATE TABLE IF NOT EXISTS swap_requests (
-      id            INTEGER PRIMARY KEY AUTOINCREMENT,
-      assignment_id INTEGER NOT NULL REFERENCES assignments(id) ON DELETE CASCADE,
-      requester_id  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      assignment_id  INTEGER NOT NULL REFERENCES assignments(id) ON DELETE CASCADE,
+      requester_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       target_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-      status        TEXT    NOT NULL DEFAULT 'pending'
-                    CHECK (status IN ('pending', 'accepted', 'declined', 'cancelled')),
-      created_at    TEXT    NOT NULL DEFAULT (datetime('now'))
+      status         TEXT    NOT NULL DEFAULT 'pending'
+                     CHECK (status IN ('pending', 'accepted', 'declined', 'cancelled')),
+      created_at     TEXT    NOT NULL DEFAULT (datetime('now'))
     );
 
     -- The queries that will run most often: "who is on this shift" and
@@ -106,13 +122,13 @@ export function migrate() {
   `);
 
   // A 24/7 operation needs the day covered end to end with no gaps
-  const count = db.prepare('SELECT COUNT(*) AS n FROM shift_types').get().n;
-  if (count === 0) {
+  const existing = queryOne<{ n: number }>('SELECT COUNT(*) AS n FROM shift_types');
+  if (existing && existing.n === 0) {
     const insert = db.prepare(
       'INSERT INTO shift_types (name, start_time, end_time) VALUES (?, ?, ?)'
     );
-    insert.run('Morning',   '06:00', '14:00');
+    insert.run('Morning', '06:00', '14:00');
     insert.run('Afternoon', '14:00', '22:00');
-    insert.run('Night',     '22:00', '06:00');
+    insert.run('Night', '22:00', '06:00');
   }
 }

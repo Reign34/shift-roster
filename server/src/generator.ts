@@ -1,3 +1,7 @@
+import type {
+  GeneratorInput, GeneratorResult, PersonState, Shift, Gap, Fairness
+} from './types.ts';
+
 // Builds a roster for one schedule.
 //
 // This is the part a spreadsheet can't do. The hard rules can never be broken;
@@ -21,29 +25,32 @@
 
 const MAX_SHIFTS = 5;
 
-function addDays(isoDate, days) {
+function addDays(isoDate: string, days: number): string {
   const d = new Date(isoDate + 'T00:00:00Z');
   d.setUTCDate(d.getUTCDate() + days);
   return d.toISOString().slice(0, 10);
 }
 
-export function generateRoster({ shifts, staff, unavailable, preferred }) {
+export function generateRoster(
+  { shifts, staff, unavailable, preferred }: GeneratorInput
+): GeneratorResult {
   // How each person is doing so far. Rebuilt from scratch every run, so
   // regenerating a schedule always gives a consistent result.
-  const stats = new Map(
+  const stats = new Map<number, PersonState>(
     staff.map((person) => [person.id, {
       id: person.id,
       name: person.name,
       total: 0,
       nights: 0,
-      days: new Set(),        // dates they are already working
+      days: new Set<string>(),
+      nightDates: new Set<string>(),
       lastDate: null,
       streak: 0
     }])
   );
 
-  const assignments = [];
-  const gaps = [];
+  const assignments: GeneratorResult['assignments'] = [];
+  const gaps: Gap[] = [];
 
   // Date order matters: "did they work yesterday" is only knowable if
   // yesterday has already been filled.
@@ -55,11 +62,11 @@ export function generateRoster({ shifts, staff, unavailable, preferred }) {
     const isNight = shift.shift_name === 'Night';
     const yesterday = addDays(shift.date, -1);
 
-    const eligible = [];
+    const eligible: PersonState[] = [];
     for (const person of stats.values()) {
       if (unavailable.has(`${person.id}|${shift.date}`)) continue;
       if (person.days.has(shift.date)) continue;
-      if (person.nightDates && person.nightDates.has(yesterday)) continue;
+      if (person.nightDates.has(yesterday)) continue;
       if (person.total >= MAX_SHIFTS) continue;
       eligible.push(person);
     }
@@ -77,7 +84,6 @@ export function generateRoster({ shifts, staff, unavailable, preferred }) {
       person.days.add(shift.date);
       if (isNight) {
         person.nights += 1;
-        person.nightDates = person.nightDates || new Set();
         person.nightDates.add(shift.date);
       }
       person.streak = person.lastDate === yesterday ? person.streak + 1 : 1;
@@ -95,14 +101,16 @@ export function generateRoster({ shifts, staff, unavailable, preferred }) {
     }
   }
 
-  return {
-    assignments,
-    gaps,
-    fairness: summarise(stats)
-  };
+  return { assignments, gaps, fairness: summarise(stats) };
 }
 
-function scoreOf(person, shift, isNight, yesterday, preferred) {
+function scoreOf(
+  person: PersonState,
+  shift: Shift,
+  isNight: boolean,
+  yesterday: string,
+  preferred: Set<string>
+): number {
   // Lower wins. Total shifts dominates, so the roster stays even overall;
   // the rest only break ties.
   let score = person.total * 100;
@@ -118,21 +126,25 @@ function scoreOf(person, shift, isNight, yesterday, preferred) {
   return score;
 }
 
-function summarise(stats) {
+function summarise(stats: Map<number, PersonState>): Fairness {
   const people = [...stats.values()].map((p) => ({
     id: p.id, name: p.name, total: p.total, nights: p.nights
   }));
 
+  // An empty roster would make Math.min(...[]) return Infinity, so the
+  // spread is reported as zeroes instead.
   const totals = people.map((p) => p.total);
   const nights = people.map((p) => p.nights);
+  const safeMin = (values: number[]): number => (values.length ? Math.min(...values) : 0);
+  const safeMax = (values: number[]): number => (values.length ? Math.max(...values) : 0);
 
   return {
     people: people.sort((a, b) => b.total - a.total || b.nights - a.nights),
     spread: {
-      minShifts: Math.min(...totals),
-      maxShifts: Math.max(...totals),
-      minNights: Math.min(...nights),
-      maxNights: Math.max(...nights)
+      minShifts: safeMin(totals),
+      maxShifts: safeMax(totals),
+      minNights: safeMin(nights),
+      maxNights: safeMax(nights)
     }
   };
 }

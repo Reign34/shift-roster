@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 // The secret is read lazily inside auth.js, so setting it here is enough
 process.env.JWT_SECRET = 'test-secret-not-the-real-one';
 
-const { hashPassword, verifyPassword, signToken, verifyToken } = await import('../src/auth.js');
+const { hashPassword, verifyPassword, signToken, verifyToken } = await import('../src/auth.ts');
 
 describe('password hashing', () => {
   test('the hash does not contain the password', () => {
@@ -46,11 +46,12 @@ describe('password hashing', () => {
 });
 
 describe('tokens', () => {
-  const user = { id: 7, name: 'Test Person', role: 'manager' };
+  const user = { id: 7, name: 'Test Person', role: 'manager' as const };
 
   test('a signed token verifies and carries the user', () => {
     const payload = verifyToken(signToken(user));
 
+    assert.ok(payload, 'a freshly signed token should verify');
     assert.equal(payload.sub, 7);
     assert.equal(payload.role, 'manager');
   });
@@ -87,7 +88,9 @@ describe('tokens', () => {
     // Not a security hole, but worth encoding as a test so nobody later
     // decides to put something sensitive in there.
     const token = signToken(user);
-    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString());
+    const body = token.split('.')[1];
+    assert.ok(body, 'a JWT should have three parts');
+    const payload = JSON.parse(Buffer.from(body, 'base64url').toString());
 
     assert.deepEqual(
       Object.keys(payload).sort(),

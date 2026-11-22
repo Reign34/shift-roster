@@ -1,13 +1,16 @@
 import { Router } from 'express';
-import { db, transaction } from '../db.js';
-import { requireAuth, requireManager } from '../middleware.js';
-import { generateRoster } from '../generator.js';
+import { db, transaction, queryOne, queryAll } from '../db.ts';
+import { requireAuth, requireManager, currentUser } from '../middleware.ts';
+import { generateRoster } from '../generator.ts';
+import type { Schedule, Shift, StaffMember, AvailabilityStatus, ShiftName } from '../types.ts';
 
-export const scheduleRoutes = Router();
+export const scheduleRoutes: Router = Router();
 scheduleRoutes.use(requireAuth);
 
-function eachDate(start, end) {
-  const dates = [];
+const MAX_DAYS = 62;
+
+function eachDate(start: string, end: string): string[] {
+  const dates: string[] = [];
   const cursor = new Date(start + 'T00:00:00Z');
   const last = new Date(end + 'T00:00:00Z');
   while (cursor <= last) {
@@ -17,14 +20,16 @@ function eachDate(start, end) {
   return dates;
 }
 
+type ScheduleRow = Schedule & { created_by_name: string; shift_count: number };
+
 scheduleRoutes.get('/', (req, res) => {
-  const schedules = db.prepare(`
+  const schedules = queryAll<ScheduleRow>(`
     SELECT s.*, u.name AS created_by_name,
            (SELECT COUNT(*) FROM shifts WHERE schedule_id = s.id) AS shift_count
     FROM schedules s
     JOIN users u ON u.id = s.created_by
     ORDER BY s.start_date DESC
-  `).all();
+  `);
   res.json({ schedules });
 });
 
@@ -32,31 +37,35 @@ scheduleRoutes.get('/', (req, res) => {
 // type. Doing it up front means the rest of the app only ever fills slots
 // that already exist.
 scheduleRoutes.post('/', requireManager, (req, res) => {
-  const { name, start_date, end_date, required_staff } = req.body || {};
+  const { name, start_date, end_date, required_staff } = req.body ?? {};
+  const me = currentUser(req);
 
   if (!name || !start_date || !end_date) {
-    return res.status(400).json({ error: 'Name, start date and end date are required' });
+    res.status(400).json({ error: 'Name, start date and end date are required' });
+    return;
   }
   if (end_date < start_date) {
-    return res.status(400).json({ error: 'End date cannot be before the start date' });
+    res.status(400).json({ error: 'End date cannot be before the start date' });
+    return;
   }
 
   const dates = eachDate(start_date, end_date);
-  if (dates.length > 62) {
-    return res.status(400).json({ error: 'Keep a schedule to two months or less' });
+  if (dates.length > MAX_DAYS) {
+    res.status(400).json({ error: 'Keep a schedule to two months or less' });
+    return;
   }
 
   const staffPerShift = Number(required_staff) > 0 ? Number(required_staff) : 7;
-  const types = db.prepare('SELECT id FROM shift_types ORDER BY id').all();
+  const types = queryAll<{ id: number }>('SELECT id FROM shift_types ORDER BY id');
 
   // One transaction: a schedule with only half its shifts would be worse
   // than no schedule at all.
-  const create = transaction(() => {
+  const create = transaction((): number => {
     const result = db.prepare(`
       INSERT INTO schedules (name, start_date, end_date, created_by) VALUES (?, ?, ?, ?)
-    `).run(name.trim(), start_date, end_date, req.user.id);
+    `).run(String(name).trim(), start_date, end_date, me.id);
 
-    const scheduleId = result.lastInsertRowid;
+    const scheduleId = Number(result.lastInsertRowid);
     const insertShift = db.prepare(`
       INSERT INTO shifts (schedule_id, date, shift_type_id, required_staff) VALUES (?, ?, ?, ?)
     `);
@@ -71,30 +80,46 @@ scheduleRoutes.post('/', requireManager, (req, res) => {
   res.status(201).json({ id, shifts: dates.length * types.length });
 });
 
+type ShiftRow = {
+  id: number;
+  date: string;
+  required_staff: number;
+  shift_name: ShiftName;
+  start_time: string;
+  end_time: string;
+};
+
 // The whole roster in one response. The frontend needs shifts and the people
 // on them together, and fetching assignments per shift would be 63 requests.
 scheduleRoutes.get('/:id', (req, res) => {
-  const schedule = db.prepare('SELECT * FROM schedules WHERE id = ?').get(req.params.id);
-  if (!schedule) return res.status(404).json({ error: 'No such schedule' });
+  const schedule = queryOne<Schedule>('SELECT * FROM schedules WHERE id = ?', req.params.id);
+  if (!schedule) {
+    res.status(404).json({ error: 'No such schedule' });
+    return;
+  }
 
-  const shifts = db.prepare(`
+  const shifts = queryAll<ShiftRow>(`
     SELECT sh.id, sh.date, sh.required_staff,
            st.name AS shift_name, st.start_time, st.end_time
     FROM shifts sh
     JOIN shift_types st ON st.id = sh.shift_type_id
     WHERE sh.schedule_id = ?
     ORDER BY sh.date, st.id
-  `).all(req.params.id);
+  `, req.params.id);
 
-  const assignments = db.prepare(`
+  const assignments = queryAll<{ id: number; shift_id: number; user_id: number; name: string }>(`
     SELECT a.id, a.shift_id, a.user_id, u.name
     FROM assignments a
     JOIN users u ON u.id = a.user_id
     JOIN shifts sh ON sh.id = a.shift_id
     WHERE sh.schedule_id = ?
-  `).all(req.params.id);
+  `, req.params.id);
 
-  const byShift = new Map(shifts.map((s) => [s.id, { ...s, people: [] }]));
+  type WithPeople = ShiftRow & { people: { assignment_id: number; id: number; name: string }[] };
+  const byShift = new Map<number, WithPeople>(
+    shifts.map((s) => [s.id, { ...s, people: [] }])
+  );
+
   for (const a of assignments) {
     byShift.get(a.shift_id)?.people.push({ assignment_id: a.id, id: a.user_id, name: a.name });
   }
@@ -103,26 +128,30 @@ scheduleRoutes.get('/:id', (req, res) => {
 });
 
 scheduleRoutes.post('/:id/generate', requireManager, (req, res) => {
-  const schedule = db.prepare('SELECT * FROM schedules WHERE id = ?').get(req.params.id);
-  if (!schedule) return res.status(404).json({ error: 'No such schedule' });
+  const schedule = queryOne<Schedule>('SELECT * FROM schedules WHERE id = ?', req.params.id);
+  if (!schedule) {
+    res.status(404).json({ error: 'No such schedule' });
+    return;
+  }
 
-  const shifts = db.prepare(`
+  const shifts = queryAll<Shift>(`
     SELECT sh.id, sh.date, sh.required_staff, sh.shift_type_id, st.name AS shift_name
     FROM shifts sh
     JOIN shift_types st ON st.id = sh.shift_type_id
     WHERE sh.schedule_id = ?
-  `).all(req.params.id);
+  `, req.params.id);
 
-  const staff = db.prepare("SELECT id, name FROM users WHERE role IN ('staff','manager')").all();
+  const staff = queryAll<StaffMember>(
+    "SELECT id, name FROM users WHERE role IN ('staff','manager')"
+  );
 
   // Pulled once into sets so the generator never touches the database
-  const rows = db.prepare(`
-    SELECT user_id, date, status FROM availability
-    WHERE date BETWEEN ? AND ?
-  `).all(schedule.start_date, schedule.end_date);
+  const rows = queryAll<{ user_id: number; date: string; status: AvailabilityStatus }>(`
+    SELECT user_id, date, status FROM availability WHERE date BETWEEN ? AND ?
+  `, schedule.start_date, schedule.end_date);
 
-  const unavailable = new Set();
-  const preferred = new Set();
+  const unavailable = new Set<string>();
+  const preferred = new Set<string>();
   for (const r of rows) {
     const key = `${r.user_id}|${r.date}`;
     if (r.status === 'unavailable') unavailable.add(key);
@@ -131,10 +160,10 @@ scheduleRoutes.post('/:id/generate', requireManager, (req, res) => {
 
   const result = generateRoster({ shifts, staff, unavailable, preferred });
 
-  const apply = transaction(() => {
+  const apply = transaction((): void => {
     db.prepare(`
       DELETE FROM assignments WHERE shift_id IN (SELECT id FROM shifts WHERE schedule_id = ?)
-    `).run(req.params.id);
+    `).run(Number(req.params.id));
 
     const insert = db.prepare('INSERT INTO assignments (shift_id, user_id) VALUES (?, ?)');
     for (const a of result.assignments) insert.run(a.shift_id, a.user_id);
@@ -150,45 +179,67 @@ scheduleRoutes.post('/:id/generate', requireManager, (req, res) => {
 
 scheduleRoutes.post('/:id/publish', requireManager, (req, res) => {
   const result = db.prepare("UPDATE schedules SET status = 'published' WHERE id = ?")
-    .run(req.params.id);
-  if (result.changes === 0) return res.status(404).json({ error: 'No such schedule' });
+    .run(Number(req.params.id));
+
+  if (result.changes === 0) {
+    res.status(404).json({ error: 'No such schedule' });
+    return;
+  }
   res.json({ status: 'published' });
 });
 
 scheduleRoutes.delete('/:id', requireManager, (req, res) => {
-  const result = db.prepare('DELETE FROM schedules WHERE id = ?').run(req.params.id);
-  if (result.changes === 0) return res.status(404).json({ error: 'No such schedule' });
+  const result = db.prepare('DELETE FROM schedules WHERE id = ?').run(Number(req.params.id));
+
+  if (result.changes === 0) {
+    res.status(404).json({ error: 'No such schedule' });
+    return;
+  }
   res.json({ deleted: Number(req.params.id) });
 });
 
 // Manual assignment, for the cases the generator can't know about
 scheduleRoutes.post('/shifts/:shiftId/assign', requireManager, (req, res) => {
-  const { user_id } = req.body || {};
-  const shift = db.prepare('SELECT * FROM shifts WHERE id = ?').get(req.params.shiftId);
-  if (!shift) return res.status(404).json({ error: 'No such shift' });
+  const { user_id } = req.body ?? {};
+  const shift = queryOne<{ id: number; date: string }>(
+    'SELECT * FROM shifts WHERE id = ?', req.params.shiftId
+  );
 
-  const clash = db.prepare(`
+  if (!shift) {
+    res.status(404).json({ error: 'No such shift' });
+    return;
+  }
+
+  const clash = queryOne(`
     SELECT 1 FROM assignments a
     JOIN shifts s ON s.id = a.shift_id
     WHERE a.user_id = ? AND s.date = ? AND s.id != ?
-  `).get(user_id, shift.date, shift.id);
+  `, user_id, shift.date, shift.id);
 
-  if (clash) return res.status(409).json({ error: 'Already working another shift that day' });
+  if (clash) {
+    res.status(409).json({ error: 'Already working another shift that day' });
+    return;
+  }
 
   try {
     const result = db.prepare('INSERT INTO assignments (shift_id, user_id) VALUES (?, ?)')
       .run(shift.id, user_id);
-    res.status(201).json({ id: result.lastInsertRowid });
+    res.status(201).json({ id: Number(result.lastInsertRowid) });
   } catch (err) {
-    if (String(err.message).includes('UNIQUE')) {
-      return res.status(409).json({ error: 'Already on this shift' });
+    if (String((err as Error).message).includes('UNIQUE')) {
+      res.status(409).json({ error: 'Already on this shift' });
+      return;
     }
     throw err;
   }
 });
 
 scheduleRoutes.delete('/assignments/:id', requireManager, (req, res) => {
-  const result = db.prepare('DELETE FROM assignments WHERE id = ?').run(req.params.id);
-  if (result.changes === 0) return res.status(404).json({ error: 'No such assignment' });
+  const result = db.prepare('DELETE FROM assignments WHERE id = ?').run(Number(req.params.id));
+
+  if (result.changes === 0) {
+    res.status(404).json({ error: 'No such assignment' });
+    return;
+  }
   res.json({ deleted: Number(req.params.id) });
 });
